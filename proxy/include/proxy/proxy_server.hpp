@@ -760,8 +760,6 @@ R"x*x*x(<html>
 			: m_executor(executor)
 			, m_local_socket(std::move(socket))
 			, m_remote_socket(init_proxy_stream(executor))
-			, m_udp_socket(executor)
-			, m_timer(executor)
 			, m_connection_id(id)
 			, m_tproxy(tproxy)
 			, m_local_buffer(10485760u) // 10MB max buffer size.
@@ -869,11 +867,6 @@ R"x*x*x(<html>
 			// 关闭所有 socket.
 			m_local_socket.close(ignore_ec);
 			m_remote_socket.close(ignore_ec);
-
-			m_udp_socket.close(ignore_ec);
-
-			// 取消所有定时器.
-			m_timer.cancel();
 		}
 
 		void set_tproxy_remote(
@@ -1594,6 +1587,12 @@ R"x*x*x(<html>
 					domain.push_back(read<int8_t>(p));
 				port = read<uint16_t>(p);
 
+				dst_endpoint.port(port);
+				dst_endpoint.address(
+					net::ip::make_address(domain, ec));
+				if (ec || dst_endpoint.address() == net::ip::make_address("0"))
+					dst_endpoint.address(m_local_socket.remote_endpoint().address());
+
 				log_conn_debug()
 					<< ", "
 					<< m_local_socket.remote_endpoint()
@@ -1640,50 +1639,42 @@ R"x*x*x(<html>
 					break;
 				}
 
-				if (atyp == SOCKS5_ATYP_DOMAINNAME)
-				{
-					tcp::resolver resolver{ executor };
-
-					auto targets = co_await resolver.async_resolve(
-						domain,
-						std::to_string(port),
-						net_awaitable[ec]);
-					if (ec)
-						break;
-
-					for (const auto& target : targets)
-					{
-						dst_endpoint = target.endpoint();
-						break;
-					}
-				}
+				auto remote_endp = m_local_socket.remote_endpoint();
+				auto protocol = remote_endp.address().is_v4()
+					? udp::v4() : udp::v6();
 
 				// 创建UDP端口.
-				auto protocol = dst_endpoint.address().is_v4()
-					? udp::v4() : udp::v6();
-				m_udp_socket.open(protocol, ec);
+				udp::socket local_udp_socket(m_executor);
+				local_udp_socket.open(protocol, ec);
 				if (ec)
 					break;
 
-				m_udp_socket.bind(
-					udp::endpoint(protocol, dst_endpoint.port()), ec);
+				// 如果有指定绑定本地地址, 则创建绑定到指定地址的 udp socket 用于数据发送.
+				std::optional<udp::socket> remote_bind_socket;
+
+				// 绑定输出网络.
+				auto bind_if = udp::endpoint(protocol, 0);
+				if (m_bind_interface)
+				{
+					bind_if.address(*m_bind_interface);
+
+					remote_bind_socket.emplace(m_executor);
+					remote_bind_socket->open(protocol, ec);
+					if (ec)
+						break;
+					remote_bind_socket->bind(bind_if, ec);
+				}
+
+				local_udp_socket.bind(udp::endpoint(), ec);
 				if (ec)
 					break;
 
-				auto remote_endp = m_local_socket.remote_endpoint();
+				// 所有发向 udp socket 的数据, 都将转发到 m_local_udp_endpoint
+				// 除非地址是 m_local_udp_endpoint 本身除外.
+				m_local_udp_endpoint.address(remote_endp.address());
+				m_local_udp_endpoint.port(dst_endpoint.port());
 
-				// 所有发向 udp socket 的数据, 都将转发到 m_local_udp_address
-				// 除非地址是 m_local_udp_address 本身除外.
-				m_local_udp_address = remote_endp.address();
-
-				// 开启udp socket数据接收, 并计时, 如果在一定时间内没有接收到数据包
-				// 则关闭 udp socket 等相关资源.
-				net::co_spawn(executor,
-					tick(), net::detached);
-
-				net::co_spawn(executor,
-					forward_udp(), net::detached);
-
+				// 开始回复客户端 udp 关联成功消息.
 				wbuf.consume(wbuf.size());
 				auto wp = (char*)wbuf.prepare(64 + domain.size()).data();
 
@@ -1691,19 +1682,21 @@ R"x*x*x(<html>
 				write<uint8_t>(0, wp);					// REP
 				write<uint8_t>(0x00, wp);				// RSV
 
-				auto local_endp = m_udp_socket.local_endpoint(ec);
+				auto local_endp = local_udp_socket.local_endpoint(ec);
 				if (ec)
 					break;
 
 				log_conn_debug()
 					<< ", local udp address: "
-					<< m_local_udp_address.to_string()
+					<< m_local_udp_endpoint
 					<< ", udp socket: "
 					<< local_endp;
 
 				if (local_endp.address().is_v4())
 				{
 					auto uaddr = local_endp.address().to_v4().to_uint();
+					if (uaddr == 0)
+						uaddr = m_local_socket.local_endpoint().address().to_v4().to_uint();
 
 					write<uint8_t>(SOCKS5_ATYP_IPV4, wp);
 					write<uint32_t>(uaddr, wp);
@@ -1731,6 +1724,28 @@ R"x*x*x(<html>
 						<< ec.message();
 					co_return;
 				}
+
+				// 在此等待 tcp 连接断开.
+				if (!remote_bind_socket)
+				{
+					co_await(m_local_socket.async_read_some(m_local_buffer.prepare(1), net_awaitable[ec])
+						||
+						forward_udp(local_udp_socket, local_udp_socket));
+				}
+				else
+				{
+					co_await(m_local_socket.async_read_some(m_local_buffer.prepare(1), net_awaitable[ec])
+						||
+						forward_udp(local_udp_socket, *remote_bind_socket)
+						||
+						forward_udp(*remote_bind_socket, local_udp_socket)
+						);
+				}
+
+				// 关闭 udp socket.
+				local_udp_socket.close(ec);
+				if (remote_bind_socket)
+					remote_bind_socket->close(ec);
 
 				co_return;
 			} while (0);
@@ -1842,7 +1857,7 @@ R"x*x*x(<html>
 			co_return;
 		}
 
-		inline net::awaitable<void> forward_udp()
+		inline net::awaitable<void> forward_udp(udp::socket& client, udp::socket& server)
 		{
 			[[maybe_unused]] auto self = shared_from_this();
 			auto executor = co_await net::this_coro::executor;
@@ -1850,22 +1865,20 @@ R"x*x*x(<html>
 			boost::system::error_code ec;
 
 			udp::endpoint remote_endp;
-			udp::endpoint local_endp;
 
 			char read_buffer[4096];
 			size_t send_total = 0;
 			size_t recv_total = 0;
 
 			const char* rbuf = &read_buffer[96];
-			char* wbuf = &read_buffer[96];
 
 			while (!m_abort)
 			{
 				// 重置 udp 超时时间.
 				m_udp_timeout = m_option.udp_timeout_;
 
-				auto bytes = co_await m_udp_socket.async_receive_from(
-					net::buffer(wbuf, 4000),
+				auto bytes = co_await client.async_receive_from(
+					net::buffer((char*)rbuf, 4000),
 					remote_endp,
 					net_awaitable[ec]);
 				if (ec)
@@ -1874,10 +1887,8 @@ R"x*x*x(<html>
 				auto rp = rbuf;
 
 				// 如果数据包来自 socks 客户端, 则解析数据包并将数据转发给目标主机.
-				if (remote_endp.address() == m_local_udp_address)
+				if (remote_endp == m_local_udp_endpoint)
 				{
-					local_endp = remote_endp;
-
 					//  +----+------+------+----------+-----------+----------+
 					//  |RSV | FRAG | ATYP | DST.ADDR | DST.PORT  |   DATA   |
 					//  +----+------+------+----------+-----------+----------+
@@ -1943,7 +1954,7 @@ R"x*x*x(<html>
 
 					send_total++;
 
-					co_await m_udp_socket.async_send_to(
+					co_await server.async_send_to(
 						net::buffer(rp, udp_size),
 						remote_endp,
 						net_awaitable[ec]);
@@ -1956,7 +1967,7 @@ R"x*x*x(<html>
 					auto udp_size = bytes + head_size;
 
 					// 在数据包前面添加 socks5 udp 头部, 然后转发给 socks 客户端.
-					auto wp = wbuf - head_size;
+					char* wp = (char*)(rbuf - head_size);
 
 					write<uint16_t>(0x0, wp); // rsv
 					write<uint8_t>(0x0, wp); // frag
@@ -1981,12 +1992,12 @@ R"x*x*x(<html>
 
 					recv_total++;
 
-					// 更新 wbuf 指针到 udp header 位置.
-					wbuf = wbuf - head_size;
+					// 指向 udp header 位置开始发送数据.
+					auto wbuf = rbuf - head_size;
 
-					co_await m_udp_socket.async_send_to(
+					co_await server.async_send_to(
 						net::buffer(wbuf, udp_size),
-						local_endp,
+						m_local_udp_endpoint,
 						net_awaitable[ec]);
 				}
 			}
@@ -1997,38 +2008,6 @@ R"x*x*x(<html>
 				<< ", send total: "
 				<< send_total
 				<< ", forward_udp quit";
-
-			co_return;
-		}
-
-		inline net::awaitable<void> tick()
-		{
-			[[maybe_unused]] auto self = shared_from_this();
-			boost::system::error_code ec;
-
-			while (!m_abort)
-			{
-				m_timer.expires_after(std::chrono::seconds(1));
-				co_await m_timer.async_wait(net_awaitable[ec]);
-				if (ec)
-				{
-					log_conn_warning()
-						<< ", ec: "
-						<< ec.message();
-					break;
-				}
-
-				if (--m_udp_timeout <= 0)
-				{
-					log_conn_debug()
-						<< ", udp socket expired";
-					m_udp_socket.close(ec);
-					break;
-				}
-			}
-
-			log_conn_debug()
-				<< ", udp expired timer quit";
 
 			co_return;
 		}
@@ -4644,18 +4623,11 @@ R"x*x*x(<html>
 		// m_remote_socket 远程 socket, 即连接远程代理服务端或远程服务的 socket.
 		variant_stream_type m_remote_socket;
 
-		// 用于 socsks5 代理中的 udp 通信.
-		udp::socket m_udp_socket;
-
 		// m_bind_interface 用于向外发起连接时, 指定的 bind 地址.
 		std::optional<net::ip::address> m_bind_interface;
 
-		// m_local_udp_address 用于保存 udp 通信时, 本地的地址.
-		net::ip::address m_local_udp_address;
-
-		// m_timer 用于定时检查 udp 会话是否过期, 由于 udp 通信是无连接的, 如果 2 端长时间
-		// 没有数据通信, 则可能会话已经失效, 此时应该关闭 udp socket 以及相关资源.
-		net::steady_timer m_timer;
+		// m_local_udp_endpoint 用于保存 udp 通信时, 本地的地址.
+		udp::endpoint m_local_udp_endpoint;
 
 		// m_timeout udp 会话超时时间, 默认 60 秒.
 		int m_udp_timeout{ udp_session_expired_time };
