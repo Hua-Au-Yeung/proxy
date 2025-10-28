@@ -80,7 +80,7 @@
 # pragma warning(disable: 4819)
 #endif
 
-#include <boost/json/src.hpp>
+#include <boost/json.hpp>
 
 #ifdef _MSC_VER
 # pragma warning(pop)
@@ -816,7 +816,7 @@ R"x*x*x(<html>
 				try
 				{
 					m_bridge_proxy =
-						std::make_unique<urls::url_view>(
+						std::make_unique<urls::url>(
 							m_option.proxy_pass_);
 				}
 				catch (const std::exception& e)
@@ -2168,28 +2168,30 @@ R"x*x*x(<html>
 
 			for (const auto& [user, pwd, addr, proxy_pass] : m_option.auth_users_)
 			{
-				if (!proxy_pass.empty())
-				{
-					try
-					{
-						m_bridge_proxy =
-							std::make_unique<urls::url_view>(proxy_pass);
-					}
-					catch (const std::exception& e)
-					{
-						log_conn_warning()
-							<< ", auth_users params proxy_pass error: "
-							<< proxy_pass
-							<< ", exception: "
-							<< e.what();
-					}
-				}
-
 				if (user == userid)
 				{
 					verify_passed = true;
+
 					user_rate_limit_config(user);
 					update_bind_interface(addr);
+
+					if (!proxy_pass.empty())
+					{
+						try
+						{
+							m_bridge_proxy =
+								std::make_unique<urls::url>(proxy_pass);
+						}
+						catch (const std::exception& e)
+						{
+							log_conn_warning()
+								<< ", auth_users params proxy_pass error: "
+								<< proxy_pass
+								<< ", exception: "
+								<< e.what();
+						}
+					}
+
 					break;
 				}
 			}
@@ -2359,28 +2361,30 @@ R"x*x*x(<html>
 
 			for (auto [user, pwd, addr, proxy_pass] : m_option.auth_users_)
 			{
-				if (!proxy_pass.empty())
-				{
-					try
-					{
-						m_bridge_proxy =
-							std::make_unique<urls::url_view>(proxy_pass);
-					}
-					catch (const std::exception& e)
-					{
-						log_conn_warning()
-							<< ", auth_users params proxy_pass error: "
-							<< proxy_pass
-							<< ", exception: "
-							<< e.what();
-					}
-				}
-
 				if (uname == user && passwd == pwd)
 				{
 					verify_passed = true;
+
 					user_rate_limit_config(user);
 					update_bind_interface(addr);
+
+					if (!proxy_pass.empty())
+					{
+						try
+						{
+							m_bridge_proxy =
+								std::make_unique<urls::url>(proxy_pass);
+						}
+						catch (const std::exception& e)
+						{
+							log_conn_warning()
+								<< ", auth_users params proxy_pass error: "
+								<< proxy_pass
+								<< ", exception: "
+								<< e.what();
+						}
+					}
+
 					break;
 				}
 			}
@@ -2789,7 +2793,7 @@ R"x*x*x(<html>
 				co_return false;
 			}
 			int name_length = read<uint8_t>(p);
-			if (name_length <= 0 || name_length > 255)
+			if (name_length < 0 || name_length > 255)
 			{
 				log_conn_warning()
 					<< ", socks negotiation, invalid name length";
@@ -2823,7 +2827,7 @@ R"x*x*x(<html>
 				uname.push_back(read<int8_t>(p));
 
 			int passwd_len = read<uint8_t>(p);
-			if (passwd_len <= 0 || passwd_len > 255)
+			if (passwd_len < 0 || passwd_len > 255)
 			{
 				log_conn_warning()
 					<< ", socks negotiation, invalid passwd length";
@@ -2865,28 +2869,30 @@ R"x*x*x(<html>
 
 			for (auto [user, pwd, addr, proxy_pass] : m_option.auth_users_)
 			{
-				if (!proxy_pass.empty())
-				{
-					try
-					{
-						m_bridge_proxy =
-							std::make_unique<urls::url_view>(proxy_pass);
-					}
-					catch (const std::exception& e)
-					{
-						log_conn_warning()
-							<< ", auth_users params proxy_pass error: "
-							<< proxy_pass
-							<< ", exception: "
-							<< e.what();
-					}
-				}
-
 				if (uname == user && passwd == pwd)
 				{
 					verify_passed = true;
+
 					user_rate_limit_config(user);
 					update_bind_interface(addr);
+
+					if (!proxy_pass.empty())
+					{
+						try
+						{
+							m_bridge_proxy =
+								std::make_unique<urls::url>(proxy_pass);
+						}
+						catch (const std::exception& e)
+						{
+							log_conn_warning()
+								<< ", auth_users params proxy_pass error: "
+								<< proxy_pass
+								<< ", exception: "
+								<< e.what();
+						}
+					}
+
 					break;
 				}
 			}
@@ -3167,6 +3173,19 @@ R"x*x*x(<html>
 					<< ", with upstream noise completed";
 			}
 
+			auto scheme = boost::to_lower_copy(std::string(m_bridge_proxy->scheme()));
+
+			// 判断是否使用 ssl 加密与下一级代理通信.
+			// 这里仅当 scheme 为 socks协议后辍是 s 时启用 ssl 加密.
+			// 其它 scheme 仍按 scheme 含义中是否包括 ssl 加密来处理.
+			if (scheme == "socks5s" ||
+				scheme == "sockss" ||
+				scheme == "socks4as" ||
+				scheme == "socks4s")
+			{
+				m_option.proxy_pass_use_ssl_ = true;
+			}
+
 			// 使用ssl加密与下一级代理通信.
 			if (m_option.proxy_pass_use_ssl_)
 			{
@@ -3187,8 +3206,6 @@ R"x*x*x(<html>
 					}
 				}
 			}
-
-			auto scheme = m_bridge_proxy->scheme();
 
 			auto instantiate_stream =
 				[this,
@@ -3340,10 +3357,10 @@ R"x*x*x(<html>
 				opt.username = std::string(m_bridge_proxy->user());
 				opt.password = std::string(m_bridge_proxy->password());
 
-				if (scheme == "socks4")
-					opt.version = socks4_version;
-				else if (scheme == "socks4a")
+				if (scheme.starts_with("socks4a"))
 					opt.version = socks4a_version;
+				else if (scheme.starts_with("socks4"))
+					opt.version = socks4_version;
 
 				auto endpoint = co_await async_socks_handshake(
 					m_remote_socket,
@@ -4786,7 +4803,7 @@ R"x*x*x(<html>
 		proxy_server_option m_option;
 
 		// m_bridge_proxy 作为中继桥接的时候, 下游代理服务器的地址.
-		std::unique_ptr<urls::url_view> m_bridge_proxy;
+		std::unique_ptr<urls::url> m_bridge_proxy;
 
 		// m_outin_key 用于身份为客户端时, 与下游代理服务器加密通信时, 解密接收到
 		// 下游代理服务器数据的 key.
